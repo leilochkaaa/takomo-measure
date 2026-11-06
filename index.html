@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wrist-to-Floor Camera</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --text: #141414; --muted: #6b6b6b;
+    --accent: #ee7a30; --ok: #2e8b57; --warn: #c98a00; --bad: #c0392b; --line: #e3e3e0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121212; --card: #1d1d1d; --text: #f2f2f2; --muted: #a0a0a0; --line: #333; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  main > h1, main > .sub, main > .card, main > .bar { max-width: 720px; margin-left: auto; margin-right: auto; }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  label { font-size: 14px; color: var(--muted); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type=number] { width: 90px; font-size: 18px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+  button { font: 600 15px system-ui; padding: 10px 14px; border-radius: 8px; border: 0; background: var(--accent); color: #fff; cursor: pointer; }
+  button.secondary { background: var(--line); color: var(--text); }
+  button:disabled { opacity: .5; cursor: default; }
+  /* The stage takes the camera's own shape and always fits on screen, so head and feet stay visible */
+  .stage { --ar: 0.75; position: relative; margin: 0 auto; background: #000; border-radius: 12px; overflow: hidden;
+           aspect-ratio: var(--ar); width: min(100%, calc((100dvh - 24px) * var(--ar))); }
+  .stage video, .stage canvas, .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .mirror { transform: scaleX(-1); }
+  #hint { position: absolute; left: 8px; right: 8px; bottom: 8px; background: rgba(0,0,0,.65); color: #fff; padding: 8px 10px; border-radius: 8px; font-size: 15px; text-align: center; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .big { font-size: 34px; font-weight: 700; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  ul { margin: 6px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; }
+  details { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Wrist-to-floor by camera</h1>
+  <p class="sub">Prototype · MediaPipe Pose runs in your browser, the video never leaves this device.</p>
+
+  <div class="card">
+    <div class="row">
+      <label for="height">Your height (cm)</label>
+      <input id="height" type="number" min="120" max="220" value="175">
+      <label><input id="shoes" type="checkbox"> I'm wearing shoes (+2.5 cm)</label>
+      <button id="startCam" disabled>Start camera</button>
+      <button id="pickPhoto" class="secondary" disabled>Use a photo</button>
+      <input id="file" type="file" accept="image/*" hidden>
+    </div>
+    <ul>
+      <li>Phone at waist height, upright, 2–3 m away. Whole body in frame, head to feet.</li>
+      <li>Stand straight, arms relaxed and hanging at your sides. Wear the shoes you golf in.</li>
+      <li>Hold still for ~3 seconds.</li>
+    </ul>
+  </div>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted hidden></video>
+    <img id="photo" alt="" hidden>
+    <canvas id="canvas"></canvas>
+    <div id="hint">Loading the pose model…</div>
+  </div>
+  <div class="bar"><div id="progress"></div></div>
+
+  <div class="card" id="resultCard" hidden>
+    <div class="big" id="result"></div>
+    <div id="verdict"></div>
+    <details><summary>How this was measured</summary><div id="debug"></div></details>
+  </div>
+</main>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.2/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task";
+
+// MediaPipe landmark indices
+const NOSE = 0, L_SH = 11, R_SH = 12, L_WR = 15, R_WR = 16, L_HIP = 23, R_HIP = 24,
+      L_KNEE = 25, R_KNEE = 26, L_ANK = 27, R_ANK = 28, L_HEEL = 29, R_HEEL = 30, L_TOE = 31, R_TOE = 32,
+      L_PINKY = 17, R_PINKY = 18, L_INDEX = 19, R_INDEX = 20;
+const BONES = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,29],[28,30],[27,31],[28,32]];
+
+// Takomo's own height → men's average wrist-to-floor table (from their fitting quiz), cm
+const TAKOMO_TABLE = [
+  { h: [0, 155], w: [0, 78] }, { h: [156, 160], w: [75, 81] }, { h: [161, 168], w: [78, 86] },
+  { h: [169, 183], w: [84, 91] }, { h: [184, 191], w: [87, 96] }, { h: [192, 196], w: [94, 99] },
+  { h: [197, 300], w: [97, 120] },
+];
+
+const NEEDED = 30;      // stable frames to collect
+const MAX_STD_CM = 1.5; // how still the measurement must be
+
+const $ = (id) => document.getElementById(id);
+const video = $("video"), photo = $("photo"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+let landmarker, samples = [], running = false, lastTs = 0, lastMeasure = null;
+
+const hint = (t) => ($("hint").textContent = t);
+
+const fileset = await FilesetResolver.forVisionTasks(WASM);
+const createLandmarker = (delegate) => PoseLandmarker.createFromOptions(fileset, {
+  baseOptions: { modelAssetPath: MODEL, delegate },
+  runningMode: "VIDEO",
+  numPoses: 1,
+  outputSegmentationMasks: true,
+});
+try {
+  landmarker = await createLandmarker("GPU");
+} catch {
+  landmarker = await createLandmarker("CPU"); // older phones / browsers without WebGL
+}
+$("startCam").disabled = false;
+$("pickPhoto").disabled = false;
+hint("Ready. Enter your height and start the camera.");
+
+// --- geometry -------------------------------------------------------------
+function angle(a, b, c) {
+  const v1 = [a.x - b.x, a.y - b.y], v2 = [c.x - b.x, c.y - b.y];
+  const cos = (v1[0] * v2[0] + v1[1] * v2[1]) / (Math.hypot(...v1) * Math.hypot(...v2) + 1e-9);
+  return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+}
+
+// Top of the head: first row of the person silhouette above the nose (normalised 0..1)
+function headTop(mask, nose) {
+  const w = mask.width, h = mask.height, data = mask.getAsFloat32Array();
+  const cx = Math.round(nose.x * w), half = Math.round(w * 0.06);
+  for (let y = 0; y < Math.round(nose.y * h); y++) {
+    for (let x = Math.max(0, cx - half); x < Math.min(w, cx + half); x++) {
+      if (data[y * w + x] > 0.5) return y / h;
+    }
+  }
+  return null;
+}
+
+// Checks the pose is usable; returns a problem message, or null if all good
+function poseProblem(p, top, floor) {
+  const vis = (i) => (p[i].visibility ?? 1) > 0.5;
+  if (![NOSE, L_ANK, R_ANK].every(vis)) return "Step back: I need to see you from head to feet.";
+  if (![L_WR, R_WR].every(vis)) return "I can't see your wrists. Let your arms hang by your sides, hands out of pockets.";
+  if (top === null || top < 0.01) return "Your head is cut off. Step back or tilt the phone.";
+  if (floor > 0.985) return "Your feet are cut off. Step back.";
+  if ((floor - top) * canvas.height < 300) return "Come a bit closer.";   // enough pixels on the body, whatever the resolution
+  // Relaxed hanging arms: straight elbows, wrists at about hip level or lower (MediaPipe hips sit at the hip joint)
+  const thigh = (p[L_KNEE].y + p[R_KNEE].y) / 2 - (p[L_HIP].y + p[R_HIP].y) / 2;
+  const wristsDown = p[L_WR].y > p[L_HIP].y - 0.15 * thigh && p[R_WR].y > p[R_HIP].y - 0.15 * thigh;
+  const armsStraight = angle(p[L_SH], p[13], p[L_WR]) > 160 && angle(p[R_SH], p[14], p[R_WR]) > 160;
+  if (!wristsDown || !armsStraight) return "Let your arms hang straight down by your sides, hands relaxed.";
+  if (angle(p[L_HIP], p[L_KNEE], p[L_ANK]) < 165 || angle(p[R_HIP], p[R_KNEE], p[R_ANK]) < 165) return "Stand up straight, knees not bent.";
+  if (Math.abs(p[L_SH].y - p[R_SH].y) > 0.03) return "Stand square to the camera, shoulders level.";
+  return null;
+}
+
+// Bottom of the shoes: last row of the silhouette below the ankles (normalised 0..1).
+// The heel/toe landmarks sit on the foot, a few cm above the sole, so they put the floor too high.
+function soleBottom(mask, p) {
+  const w = mask.width, h = mask.height, data = mask.getAsFloat32Array();
+  const xs = [p[L_ANK].x, p[R_ANK].x, p[L_HEEL].x, p[R_HEEL].x, p[L_TOE].x, p[R_TOE].x];
+  const x0 = Math.max(0, Math.round((Math.min(...xs) - 0.04) * w)), x1 = Math.min(w, Math.round((Math.max(...xs) + 0.04) * w));
+  const yStart = Math.round(Math.max(p[L_ANK].y, p[R_ANK].y) * h);
+  let last = null;
+  for (let y = yStart; y < h; y++) {
+    let any = false;
+    for (let x = x0; x < x1; x++) if (data[y * w + x] > 0.5) { any = true; break; }
+    if (any) last = y; else if (last !== null) break;   // stop at the first empty row under the feet
+  }
+  return last === null ? null : (last + 1) / h;
+}
+
+const SHOE_CM = 2.5;   // typical golf-shoe sole; the height the golfer types is without shoes
+const params0 = new URLSearchParams(location.search);
+const WRIST_OFFSET_CM = +(params0.get("offset") || 0);   // calibration from tape-measure checks, e.g. ?offset=-1.5
+// The pose model's wrist point is the joint centre, ~4 cm above the crease a tape measures from.
+// The crease sits this share of the way from that point towards the index/pinky knuckle points.
+// Calibrated on ONE person (7 Nov: tape 71 cm, height 150 cm); re-check on more golfers. Override with ?k=
+const CREASE_K = +(params0.get("k") || 0.78);
+
+function creaseY(p, wr, pinky, index) {
+  const vis = (i) => (p[i].visibility ?? 1) > 0.3;
+  if (!vis(pinky) || !vis(index)) return p[wr].y;          // no hand points: fall back to the joint
+  return p[wr].y + CREASE_K * ((p[pinky].y + p[index].y) / 2 - p[wr].y);
+}
+
+function measureFrame(result, heightCm) {
+  const p = result.landmarks?.[0];
+  const mask = result.segmentationMasks?.[0];
+  if (!p || !mask) return { problem: "No person found. Make sure your whole body is in the frame." };
+  const top = headTop(mask, p[NOSE]);
+  const footLm = Math.max(p[L_HEEL].y, p[R_HEEL].y, p[L_TOE].y, p[R_TOE].y);
+  const sole = soleBottom(mask, p);
+  const floor = sole ?? footLm;
+  const problem = poseProblem(p, top, floor);
+  if (problem) return { problem, p, top, floor };
+  const standing = heightCm + ($("shoes").checked ? SHOE_CM : 0);
+  const cmPerUnit = standing / (floor - top);          // scale from the known height
+  const wrist = (creaseY(p, L_WR, L_PINKY, L_INDEX) + creaseY(p, R_WR, R_PINKY, R_INDEX)) / 2;
+  return { p, top, floor, wrist, cm: (floor - wrist) * cmPerUnit + WRIST_OFFSET_CM,
+           floorFrom: sole !== null ? "silhouette" : "foot landmarks",
+           soleBelowFootCm: sole !== null ? (sole - footLm) * cmPerUnit : null };
+}
+
+// --- drawing --------------------------------------------------------------
+function draw(m) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!m.p) return;
+  const W = canvas.width, H = canvas.height;
+  ctx.lineWidth = Math.max(2, W / 200);
+  ctx.strokeStyle = m.problem ? "#ffb020" : "#3ddc84";
+  for (const [a, b] of BONES) {
+    ctx.beginPath(); ctx.moveTo(m.p[a].x * W, m.p[a].y * H); ctx.lineTo(m.p[b].x * W, m.p[b].y * H); ctx.stroke();
+  }
+  const hline = (y, color) => { ctx.strokeStyle = color; ctx.setLineDash([8, 6]); ctx.beginPath(); ctx.moveTo(0, y * H); ctx.lineTo(W, y * H); ctx.stroke(); ctx.setLineDash([]); };
+  if (m.top !== null && m.top !== undefined) hline(m.top, "#5aa9ff");
+  if (m.floor) hline(m.floor, "#5aa9ff");
+  if (m.wrist) hline(m.wrist, "#ee7a30");
+}
+
+// --- result ---------------------------------------------------------------
+const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+const std = (a) => { const m = a.reduce((s, x) => s + x, 0) / a.length; return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / a.length); };
+
+function showResult(values, heightCm) {
+  const med = median(values), spread = Math.max(1.5, 2 * std(values));
+  const row = TAKOMO_TABLE.find((r) => heightCm >= r.h[0] && heightCm <= r.h[1]);
+  const inRange = row && med >= row.w[0] - 1 && med <= row.w[1] + 1;
+  $("result").textContent = `≈ ${med.toFixed(1)} cm  (±${spread.toFixed(1)})`;
+  $("verdict").innerHTML = inRange
+    ? `<span class="ok">✅ Consistent with the typical range for your height (${row.w[0]}–${row.w[1]} cm). Confidence: higher.</span>`
+    : `<span class="warn">⚠️ Outside the typical range for your height (${row?.w[0]}–${row?.w[1]} cm). Either your proportions are unusual (useful to know!) or the photo angle is off. Try again, or check with a tape measure.</span>`;
+  const lm = lastMeasure || {};
+  $("debug").textContent = `${values.length} frames · scale from your height ${heightCm} cm` +
+    `${$("shoes").checked ? " + 2.5 cm shoes" : ""} · spread ${std(values).toFixed(2)} cm. ` +
+    `Head top from the body silhouette, floor from the ${lm.floorFrom || "?"}` +
+    (lm.soleBelowFootCm != null ? ` (sole found ${lm.soleBelowFootCm.toFixed(1)} cm below the foot landmarks)` : "") +
+    `, wrist from both wrist points${WRIST_OFFSET_CM ? `, calibration ${WRIST_OFFSET_CM} cm` : ""}.`;
+  $("resultCard").hidden = false;
+}
+
+// Give the stage the picture's own shape and bring the whole of it into view
+function fitStage(w, h) {
+  $("stage").style.setProperty("--ar", (w / h).toFixed(4));
+  requestAnimationFrame(() => {
+    $("stage").scrollIntoView({ behavior: "auto", block: "center" });
+    const r = $("stage").getBoundingClientRect();   // for layout checks: does the stage fit the window?
+    document.body.dataset.stage = `${Math.round(r.top)},${Math.round(r.bottom)},${innerHeight}`;
+  });
+}
+
+// --- camera mode ----------------------------------------------------------
+$("startCam").onclick = async () => {
+  samples = []; $("resultCard").hidden = true; photo.hidden = true;
+  try {
+    // ask for the camera's best resolution in whatever shape it has (laptops: landscape, phones: portrait)
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1920 }, height: { ideal: 1920 } }, audio: false });
+  } catch (e) {
+    hint("No camera access. The camera needs https:// or localhost. Try 'Use a photo' instead."); return;
+  }
+  await video.play();
+  video.hidden = false;
+  video.classList.add("mirror"); canvas.classList.add("mirror");
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  fitStage(video.videoWidth, video.videoHeight);
+  running = true;
+  requestAnimationFrame(loop);
+};
+
+function loop() {
+  if (!running) return;
+  const ts = performance.now();
+  if (ts - lastTs > 30) {
+    lastTs = ts;
+    const result = landmarker.detectForVideo(video, ts);
+    const m = measureFrame(result, +$("height").value);
+    result.segmentationMasks?.forEach((mk) => mk.close());
+    draw(m);
+    if (m.problem) { hint(m.problem); samples = []; }
+    else {
+      lastMeasure = m;
+      samples.push(m.cm); if (samples.length > NEEDED) samples.shift();
+      const still = samples.length >= 10 && std(samples) < MAX_STD_CM;
+      hint(samples.length < NEEDED ? "Great, hold still…" : still ? "Done!" : "Hold still, the number is still moving…");
+      if (samples.length >= NEEDED && still) {
+        running = false;
+        video.srcObject.getTracks().forEach((t) => t.stop());
+        showResult(samples, +$("height").value);
+        return;
+      }
+    }
+    $("progress").style.width = `${(100 * samples.length) / NEEDED}%`;
+  }
+  requestAnimationFrame(loop);
+}
+
+// --- photo mode (works without camera / https) ----------------------------
+$("pickPhoto").onclick = () => $("file").click();
+$("file").onchange = (e) => e.target.files[0] && measurePhoto(URL.createObjectURL(e.target.files[0]));
+
+// ?img=path.jpg&h=170 measures a photo straight away (handy for demos and tests)
+const params = new URLSearchParams(location.search);
+if (params.get("h")) $("height").value = params.get("h");
+if (params.get("img")) measurePhoto(params.get("img"));
+
+async function measurePhoto(src) {
+  running = false; video.hidden = true; video.classList.remove("mirror"); canvas.classList.remove("mirror");
+  photo.src = src; await photo.decode(); photo.hidden = false;
+  canvas.width = photo.naturalWidth; canvas.height = photo.naturalHeight;
+  fitStage(photo.naturalWidth, photo.naturalHeight);
+  const values = []; let m;
+  for (let i = 0; i < 5; i++) {   // a few passes on the same photo let the tracker settle
+    lastTs += 100;
+    const result = landmarker.detectForVideo(photo, lastTs);
+    m = measureFrame(result, +$("height").value);
+    result.segmentationMasks?.forEach((mk) => mk.close());
+    if (!m.problem) { values.push(m.cm); lastMeasure = m; }
+  }
+  draw(m);
+  $("progress").style.width = values.length ? "100%" : "0";
+  if (values.length) { hint("Measured from the photo."); showResult(values, +$("height").value); }
+  else { hint(m.problem); $("resultCard").hidden = true; }
+  document.body.dataset.done = values.length ? `ok ${median(values).toFixed(1)}` : `problem: ${m.problem}`;
+}
+</script>
+</body>
+</html>
